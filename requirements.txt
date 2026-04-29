@@ -1,5 +1,5 @@
-streamlit==1.42.0
-yfinance==0.2.45
-pandas==2.2.3
-plotly==5.24.1
-openai==1.55.3
+streamlit>=1.40.0
+yfinance>=0.2.40
+pandas>=2.0.0
+plotly>=5.20.0
+openai>=1.50.0
