@@ -95,6 +95,69 @@ def fmt_market_cap(mc, symbol):
     return f"${mc:.0f}"
 
 
+def fmt_day_pct(val):
+    """Daily % change with colored dot. val is already in % (1.23 = 1.23%)."""
+    f = safe_float(val)
+    if f is None:
+        return "—"
+    emoji = "🟢" if f >= 0 else "🔴"
+    sign = "+" if f >= 0 else ""
+    return f"{emoji} {sign}{f:.2f}%"
+
+
+def fmt_day_pct_color(val):
+    """Same as fmt_day_pct but with Streamlit :green[]/:red[] color tags."""
+    f = safe_float(val)
+    if f is None:
+        return ""
+    color = "green" if f >= 0 else "red"
+    arrow = "▲" if f >= 0 else "▼"
+    sign = "+" if f >= 0 else ""
+    return f":{color}[{arrow} {sign}{f:.2f}%]"
+
+
+def fmt_big_money(value, currency="USD"):
+    """Format large dollar/shekel numbers — $1.5B, ₪50M, etc."""
+    f = safe_float(value)
+    if f is None:
+        return "N/A"
+    if currency in ("ILS", "ILA"):
+        sym = "₪"
+    elif currency == "EUR":
+        sym = "€"
+    elif currency == "GBP":
+        sym = "£"
+    else:
+        sym = "$"
+    abs_f = abs(f)
+    sign = "-" if f < 0 else ""
+    if abs_f >= 1e12:
+        return f"{sign}{sym}{abs_f / 1e12:.2f}T"
+    if abs_f >= 1e9:
+        return f"{sign}{sym}{abs_f / 1e9:.2f}B"
+    if abs_f >= 1e6:
+        return f"{sign}{sym}{abs_f / 1e6:.1f}M"
+    if abs_f >= 1e3:
+        return f"{sign}{sym}{abs_f / 1e3:.1f}K"
+    return f"{sign}{sym}{abs_f:,.0f}"
+
+
+REC_LABEL_MAP = {
+    "strong_buy": "Strong Buy",
+    "buy": "Buy",
+    "hold": "Hold",
+    "underperform": "Underperform",
+    "sell": "Sell",
+    "strong_sell": "Strong Sell",
+}
+
+
+def fmt_recommendation(rec_key):
+    if not rec_key:
+        return "—"
+    return REC_LABEL_MAP.get(rec_key.lower(), rec_key.title())
+
+
 def label_sentiment(text):
     """Naive keyword-based sentiment (not AI)"""
     text_lower = (text or "").lower()
@@ -145,7 +208,34 @@ def fetch_deep(symbol):
     row["roe"] = safe_float(info.get("returnOnEquity"))
     row["debt_to_equity"] = safe_float(info.get("debtToEquity"))
     row["current_ratio"] = safe_float(info.get("currentRatio"))
-    row["day_change"] = safe_float(info.get("regularMarketChangePercent"))
+
+    # === Financial numbers (TTM) ===
+    row["financial_currency"] = info.get("financialCurrency") or info.get("currency") or "USD"
+    row["total_revenue"] = safe_float(info.get("totalRevenue"))
+    row["gross_profits"] = safe_float(info.get("grossProfits"))
+    row["ebitda"] = safe_float(info.get("ebitda"))
+    row["net_income_ttm"] = safe_float(info.get("netIncomeToCommon"))
+    _om = safe_float(info.get("operatingMargins"))
+    _tr = safe_float(info.get("totalRevenue"))
+    row["op_income_ttm"] = (_om * _tr) if (_om is not None and _tr is not None) else None
+
+    # === Analyst forecasts (12-month) — external opinions, not advice ===
+    row["target_mean_price"] = safe_float(info.get("targetMeanPrice"))
+    row["target_high_price"] = safe_float(info.get("targetHighPrice"))
+    row["target_low_price"] = safe_float(info.get("targetLowPrice"))
+    row["num_analysts"] = info.get("numberOfAnalystOpinions")
+    row["recommendation_key"] = info.get("recommendationKey", "")
+    row["recommendation_mean"] = safe_float(info.get("recommendationMean"))
+
+    # === Daily % change — computed for accuracy ===
+    # Using ((current - prev_close) / prev_close) * 100 to avoid yfinance's
+    # inconsistent regularMarketChangePercent units across versions.
+    prev_close = safe_float(info.get("regularMarketPreviousClose")) or safe_float(info.get("previousClose"))
+    if prev_close and prev_close > 0 and price:
+        row["day_change"] = (price - prev_close) / prev_close * 100
+    else:
+        row["day_change"] = safe_float(info.get("regularMarketChangePercent"))
+
     row["fifty_two_week_high"] = safe_float(info.get("fiftyTwoWeekHigh"))
     row["fifty_two_week_low"] = safe_float(info.get("fiftyTwoWeekLow"))
 
@@ -247,6 +337,41 @@ def fetch_macro_headlines():
     return {"monetary": monetary, "geopolitical": geopolitical}
 
 
+def _fetch_quarterly_financials(symbol):
+    """Fetch latest quarter: revenue, operating income, net income.
+    Extra yfinance call; used only for Top 10 enrichment + custom analysis."""
+    try:
+        ticker = yf.Ticker(symbol)
+        qis = ticker.quarterly_income_stmt
+        if qis is None or qis.empty:
+            return {}
+        latest_col = qis.columns[0]
+        result = {
+            "q_date": (
+                latest_col.strftime("%Y-%m-%d")
+                if hasattr(latest_col, "strftime")
+                else str(latest_col)[:10]
+            ),
+        }
+
+        def _get(row_names):
+            for name in row_names:
+                if name in qis.index:
+                    return safe_float(qis.loc[name, latest_col])
+            return None
+
+        result["q_revenue"] = _get(["Total Revenue", "TotalRevenue", "Revenue"])
+        result["q_operating_income"] = _get(
+            ["Operating Income", "OperatingIncome", "Total Operating Income"]
+        )
+        result["q_net_income"] = _get(
+            ["Net Income", "Net Income Common Stockholders", "NetIncome"]
+        )
+        return result
+    except Exception:
+        return {}
+
+
 def _fetch_price_history_summary(symbol):
     """30-day price summary for AI context"""
     try:
@@ -334,31 +459,37 @@ def get_ai_insights(stock_data, news_headlines, api_key):
             f"Metrics: {', '.join(metrics) if metrics else 'limited data'}"
             f"{history_text}"
             f"{news_text}\n\n"
-            "Produce the analysis with the two-section structure described in the system prompt."
+            "Produce the analysis with the three-section structure described in the system prompt."
         )
 
         system_msg = (
-            "You are a financial data analyst writing concise stock analyses in Hebrew.\n"
-            "Output MUST use this EXACT two-section structure with the emoji headers:\n\n"
-            "📈 ניתוח טכני / מומנטום:\n"
+            "You are a financial data analyst writing concise stock analyses.\n"
+            "Output MUST use this EXACT three-section structure with the emoji headers:\n\n"
+            "📈 Technical / Momentum:\n"
             "<2 sentences describing the 30-day price trend (upward/downward/sideways), "
             "approximate range, where current price sits within that range, and momentum "
             "direction. Use observational language only — describe what the data SHOWS.>\n\n"
-            "📊 הערכת שווי קדימה:\n"
+            "📊 Forward Valuation:\n"
             "<2 sentences comparing Trailing P/E to Forward P/E. If Forward < Trailing, "
             "explain analysts expect earnings growth (so the company looks 'cheaper' on a "
             "forward basis). If Forward > Trailing, the opposite. If similar, note stability. "
             "Connect to news context if relevant.>\n\n"
+            "🔥 Hot Themes / Growth Drivers:\n"
+            "<2 sentences identifying sector tailwinds or industry trends the company is "
+            "currently positioned within (e.g., 'AI infrastructure demand', 'energy "
+            "transition', 'aging population', 'cloud migration'). Describe POSITIONING, "
+            "not predictions. If no obvious trends, write 'No notable sector tailwinds "
+            "beyond core business'.>\n\n"
             "STRICT RULES — VIOLATIONS WILL BREAK THE OUTPUT:\n"
             "- NEVER use 'buy', 'sell', 'should', 'recommend', 'target price'\n"
             "- NEVER call price levels 'entry zones', 'exit zones', 'support to buy at', "
             "'resistance to sell at'\n"
-            "- NEVER predict future prices\n"
+            "- NEVER predict future prices or specific revenue numbers\n"
             "- Use observational/descriptive language only ('the data shows', "
-            "'the trend has been', 'the price has consolidated', 'metrics suggest')\n"
+            "'the trend has been', 'the company is positioned in', 'metrics suggest')\n"
             "- Maximum 2 sentences per section\n"
-            "- Always Hebrew\n"
-            "- Always include both emoji-prefixed section headers exactly as shown"
+            "- English output\n"
+            "- Always include all three emoji-prefixed section headers exactly as shown"
         )
 
         response = client.chat.completions.create(
@@ -367,7 +498,7 @@ def get_ai_insights(stock_data, news_headlines, api_key):
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=350,
+            max_tokens=500,
             temperature=0.3,
         )
 
@@ -553,6 +684,7 @@ def run_full_discovery(weights, progress_callback=None):
         row["news"] = fetch_news_for_stock(row["symbol"], row.get("name", ""), n=2)
         row["management"] = fetch_management(row["symbol"])
         row["price_history_summary"] = _fetch_price_history_summary(row["symbol"])
+        row["quarterly"] = _fetch_quarterly_financials(row["symbol"])
         mgmt = row.get("management") or {}
         row["ceo_name"] = (mgmt.get("ceo") or {}).get("name", "")
         row["cfo_name"] = (mgmt.get("cfo") or {}).get("name", "")
@@ -594,6 +726,7 @@ def analyze_single_stock(symbol, weights, openai_key=None):
     row["news"] = fetch_news_for_stock(row["symbol"], row.get("name", ""), n=2)
     row["management"] = fetch_management(row["symbol"])
     row["price_history_summary"] = _fetch_price_history_summary(row["symbol"])
+    row["quarterly"] = _fetch_quarterly_financials(row["symbol"])
     mgmt = row.get("management") or {}
     row["ceo_name"] = (mgmt.get("ceo") or {}).get("name", "")
     row["cfo_name"] = (mgmt.get("cfo") or {}).get("name", "")
@@ -789,6 +922,7 @@ if results:
         table_rows.append({
             "#": i,
             "Symbol": row["symbol"],
+            "Day %": fmt_day_pct(row.get("day_change")),
             "Name": (row.get("name") or "")[:36],
             "Sector": row.get("sector", ""),
             "Score": round(row.get("score", 0), 1),
@@ -905,8 +1039,10 @@ if results:
     for i, row in enumerate(top10, 1):
         score = row.get("score", 0)
         score_emoji = "🟢" if score >= 60 else ("🟡" if score >= 40 else "🔴")
+        day_color_md = fmt_day_pct_color(row.get("day_change"))
+        day_part = f" {day_color_md}" if day_color_md else ""
         title = (
-            f"{score_emoji} #{i} — {row['symbol']} • "
+            f"{score_emoji} #{i} — {row['symbol']}{day_part} • "
             f"{row.get('sector', '?')} • Score {score:.0f}/100"
         )
         with st.expander(title):
@@ -930,6 +1066,52 @@ if results:
                 st.write(f"- ROE: {fmt_pct(row.get('roe'))}")
                 if row.get("debt_to_equity") is not None:
                     st.write(f"- Debt/Equity: {fmt_num(row.get('debt_to_equity'), 0)}")
+
+                # === Financial numbers (TTM + last quarter) ===
+                fc = row.get("financial_currency") or "USD"
+                quarterly = row.get("quarterly") or {}
+                has_numbers = any([
+                    row.get("total_revenue"),
+                    row.get("net_income_ttm"),
+                    row.get("op_income_ttm"),
+                    row.get("ebitda"),
+                    quarterly.get("q_revenue"),
+                ])
+                if has_numbers:
+                    st.markdown("**💵 Financial Numbers:**")
+                    if row.get("total_revenue") is not None:
+                        st.write(f"- Revenue (TTM): {fmt_big_money(row['total_revenue'], fc)}")
+                    if quarterly.get("q_revenue") is not None:
+                        q_date = quarterly.get("q_date", "")
+                        date_str = f" (quarter ending {q_date})" if q_date else ""
+                        st.write(f"- Revenue last quarter{date_str}: {fmt_big_money(quarterly['q_revenue'], fc)}")
+                    if row.get("op_income_ttm") is not None:
+                        st.write(f"- Operating Income (TTM): {fmt_big_money(row['op_income_ttm'], fc)}")
+                    if quarterly.get("q_operating_income") is not None:
+                        st.write(f"- Operating Income last quarter: {fmt_big_money(quarterly['q_operating_income'], fc)}")
+                    if row.get("net_income_ttm") is not None:
+                        st.write(f"- Net Income (TTM): {fmt_big_money(row['net_income_ttm'], fc)}")
+                    if quarterly.get("q_net_income") is not None:
+                        st.write(f"- Net Income last quarter: {fmt_big_money(quarterly['q_net_income'], fc)}")
+                    if row.get("ebitda") is not None:
+                        st.write(f"- EBITDA (TTM): {fmt_big_money(row['ebitda'], fc)}")
+
+                # === Analyst targets ===
+                target_mean = row.get("target_mean_price")
+                if target_mean is not None:
+                    st.markdown("**🎯 Analyst Targets (12-month)** *— external opinions, not advice:*")
+                    cur_price = row.get("price") or 0
+                    upside = ((target_mean - cur_price) / cur_price * 100) if cur_price else None
+                    upside_str = f"  ({upside:+.1f}% from current)" if upside is not None else ""
+                    st.write(f"- Mean target: {fmt_price(target_mean, row['symbol'], row.get('currency',''))}{upside_str}")
+                    if row.get("target_low_price") and row.get("target_high_price"):
+                        low_p = fmt_price(row['target_low_price'], row['symbol'], row.get('currency',''))
+                        high_p = fmt_price(row['target_high_price'], row['symbol'], row.get('currency',''))
+                        st.write(f"- Range: {low_p} – {high_p}")
+                    if row.get("num_analysts"):
+                        st.write(f"- Analysts covering: {row['num_analysts']}")
+                    if row.get("recommendation_key"):
+                        st.write(f"- Consensus: **{fmt_recommendation(row['recommendation_key'])}**")
 
                 mgmt = row.get("management") or {}
                 if mgmt.get("ceo") or mgmt.get("cfo"):
@@ -971,8 +1153,10 @@ if results:
         for rank, row in enumerate(rest, 11):
             score = row.get("score", 0)
             score_emoji = "🟢" if score >= 60 else ("🟡" if score >= 40 else "🔴")
+            day_color_md = fmt_day_pct_color(row.get("day_change"))
+            day_part = f" {day_color_md}" if day_color_md else ""
             title = (
-                f"{score_emoji} #{rank} — {row['symbol']} • "
+                f"{score_emoji} #{rank} — {row['symbol']}{day_part} • "
                 f"{row.get('sector', '?')} • Score {score:.0f}/100"
             )
             with st.expander(title):
@@ -993,6 +1177,29 @@ if results:
                     st.write(f"- ROE: {fmt_pct(row.get('roe'))}")
                     if row.get("debt_to_equity") is not None:
                         st.write(f"- Debt/Equity: {fmt_num(row.get('debt_to_equity'), 0)}")
+                    if row.get("forward_pe") is not None:
+                        st.write(f"- Forward P/E: {fmt_num(row.get('forward_pe'), 1)}")
+
+                    # Lightweight TTM financials (no quarterly fetch for non-Top-10)
+                    fc = row.get("financial_currency") or "USD"
+                    if any([row.get("total_revenue"), row.get("net_income_ttm"), row.get("op_income_ttm")]):
+                        st.markdown("**💵 Financial Numbers (TTM):**")
+                        if row.get("total_revenue") is not None:
+                            st.write(f"- Revenue: {fmt_big_money(row['total_revenue'], fc)}")
+                        if row.get("op_income_ttm") is not None:
+                            st.write(f"- Operating Income: {fmt_big_money(row['op_income_ttm'], fc)}")
+                        if row.get("net_income_ttm") is not None:
+                            st.write(f"- Net Income: {fmt_big_money(row['net_income_ttm'], fc)}")
+
+                    target_mean = row.get("target_mean_price")
+                    if target_mean is not None:
+                        cur_price = row.get("price") or 0
+                        upside = ((target_mean - cur_price) / cur_price * 100) if cur_price else None
+                        upside_str = f"  ({upside:+.1f}%)" if upside is not None else ""
+                        rec = fmt_recommendation(row.get("recommendation_key"))
+                        n_an = row.get("num_analysts") or "?"
+                        st.markdown(f"**🎯 Analyst target:** {fmt_price(target_mean, row['symbol'], row.get('currency',''))}{upside_str} • Consensus: {rec} • {n_an} analysts")
+
                     if row.get("industry"):
                         st.caption(f"Industry: {row['industry']}")
 
@@ -1098,7 +1305,9 @@ if results:
         else:
             cscore = custom_result.get("score", 0)
             cemoji = "🟢" if cscore >= 60 else ("🟡" if cscore >= 40 else "🔴")
-            st.markdown(f"### {cemoji} {cs} — {custom_result.get('name', '')}")
+            cday_color_md = fmt_day_pct_color(custom_result.get("day_change"))
+            cday_part = f"  {cday_color_md}" if cday_color_md else ""
+            st.markdown(f"### {cemoji} {cs}{cday_part} — {custom_result.get('name', '')}")
             sec_ind = " • ".join(filter(None, [custom_result.get("sector"), custom_result.get("industry")]))
             if sec_ind:
                 st.caption(sec_ind)
@@ -1126,6 +1335,52 @@ if results:
                     st.write(f"- Forward P/E: {fmt_num(custom_result.get('forward_pe'), 1)}")
                 if custom_result.get("next_earnings"):
                     st.write(f"- 📅 Next Report: {custom_result['next_earnings']}")
+
+            # === Financial numbers ===
+            cfc = custom_result.get("financial_currency") or "USD"
+            cquarterly = custom_result.get("quarterly") or {}
+            chas_numbers = any([
+                custom_result.get("total_revenue"),
+                custom_result.get("net_income_ttm"),
+                custom_result.get("op_income_ttm"),
+                custom_result.get("ebitda"),
+                cquarterly.get("q_revenue"),
+            ])
+            if chas_numbers:
+                st.markdown("**💵 Financial Numbers:**")
+                if custom_result.get("total_revenue") is not None:
+                    st.write(f"- Revenue (TTM): {fmt_big_money(custom_result['total_revenue'], cfc)}")
+                if cquarterly.get("q_revenue") is not None:
+                    q_date = cquarterly.get("q_date", "")
+                    date_str = f" (quarter ending {q_date})" if q_date else ""
+                    st.write(f"- Revenue last quarter{date_str}: {fmt_big_money(cquarterly['q_revenue'], cfc)}")
+                if custom_result.get("op_income_ttm") is not None:
+                    st.write(f"- Operating Income (TTM): {fmt_big_money(custom_result['op_income_ttm'], cfc)}")
+                if cquarterly.get("q_operating_income") is not None:
+                    st.write(f"- Operating Income last quarter: {fmt_big_money(cquarterly['q_operating_income'], cfc)}")
+                if custom_result.get("net_income_ttm") is not None:
+                    st.write(f"- Net Income (TTM): {fmt_big_money(custom_result['net_income_ttm'], cfc)}")
+                if cquarterly.get("q_net_income") is not None:
+                    st.write(f"- Net Income last quarter: {fmt_big_money(cquarterly['q_net_income'], cfc)}")
+                if custom_result.get("ebitda") is not None:
+                    st.write(f"- EBITDA (TTM): {fmt_big_money(custom_result['ebitda'], cfc)}")
+
+            # === Analyst targets ===
+            ctarget_mean = custom_result.get("target_mean_price")
+            if ctarget_mean is not None:
+                st.markdown("**🎯 Analyst Targets (12-month)** *— external opinions, not advice:*")
+                ccur_price = custom_result.get("price") or 0
+                cupside = ((ctarget_mean - ccur_price) / ccur_price * 100) if ccur_price else None
+                cupside_str = f"  ({cupside:+.1f}% from current)" if cupside is not None else ""
+                st.write(f"- Mean target: {fmt_price(ctarget_mean, cs, custom_result.get('currency',''))}{cupside_str}")
+                if custom_result.get("target_low_price") and custom_result.get("target_high_price"):
+                    low_p = fmt_price(custom_result['target_low_price'], cs, custom_result.get('currency',''))
+                    high_p = fmt_price(custom_result['target_high_price'], cs, custom_result.get('currency',''))
+                    st.write(f"- Range: {low_p} – {high_p}")
+                if custom_result.get("num_analysts"):
+                    st.write(f"- Analysts covering: {custom_result['num_analysts']}")
+                if custom_result.get("recommendation_key"):
+                    st.write(f"- Consensus: **{fmt_recommendation(custom_result['recommendation_key'])}**")
 
             cmgmt = custom_result.get("management") or {}
             if cmgmt.get("ceo") or cmgmt.get("cfo"):
