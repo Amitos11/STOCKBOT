@@ -50,3 +50,9 @@ Thumbs.db
 # Environment files
 .env
 .env.local
+
+# Private development files (kept local, NOT for public deployment)
+app.py
+discovery.py
+scanner.py
+history.csv
